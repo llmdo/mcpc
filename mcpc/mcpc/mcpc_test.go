@@ -72,7 +72,21 @@ func totest(model string) error {
 		log.Fatalf("unknown MCP_MODE %s", mode)
 	}
 
-	client := NewMCPClient(tr, opts)
+	clientHooks := &ClientHooks{
+		OnSend: func(id, method string) {
+			log.Printf("OnSend(%s,%s)", id, method)
+		},
+		OnResponse: func(id string, err *RPCError) {
+			log.Printf("OnResponse(%s,%+v)", id, err)
+		},
+		OnNotify: func(method string) {
+			log.Printf("OnNotify(%s)", method)
+		},
+		OnDisconnect: func(temporary bool) {
+			log.Printf("OnDisconnect(%v)", temporary)
+		},
+	}
+	client := NewMCPClient(tr, opts, clientHooks)
 	defer client.Close()
 
 	client.SetNotificationHandler(func(method string, params json.RawMessage) {

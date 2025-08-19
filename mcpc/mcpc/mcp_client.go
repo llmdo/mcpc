@@ -16,9 +16,26 @@ import (
    MCP Client
    - pending map: id -> chan response
    - 断线内部通知：清理所有 pending（立即失败）
+   - 新增改进：
+     1. readLoop 在 Close 后也会清理 pending
+     2. CallBatch 用 ticker 替代 time.After
+     3. 定义客户端内部错误码 (-32099)
+     4. Close 等待读 goroutine 退出，避免泄漏
+     5. 预留 Debug hooks
    ========================= */
 
+const (
+	ClientTransportClosedCode = -32099 // 客户端内部：传输关闭
+)
+
 type NotificationHandler func(method string, params json.RawMessage)
+
+type ClientHooks struct {
+	OnSend       func(id, method string)
+	OnResponse   func(id string, err *RPCError)
+	OnNotify     func(method string)
+	OnDisconnect func(temporary bool)
+}
 
 type MCPClient struct {
 	transport Transport
@@ -33,21 +50,30 @@ type MCPClient struct {
 	seq atomic.Uint64
 
 	closed atomic.Bool
+
+	hooks *ClientHooks
+
+	wg sync.WaitGroup // 用于等待 readLoop 完成
 }
 
-func NewMCPClient(t Transport, opts *DialOptions) *MCPClient {
+func NewMCPClient(t Transport, opts *DialOptions, hooks *ClientHooks) *MCPClient {
 	c := &MCPClient{
 		transport: t,
 		opts:      opts.WithDefaults(),
 		pending:   make(map[string]chan *RPCResponse),
+		hooks:     hooks,
 	}
+	c.wg.Add(1)
 	go c.readLoop()
 	return c
 }
 
 func (c *MCPClient) Close() error {
 	c.closed.Store(true)
-	return c.transport.Close()
+	err := c.transport.Close()
+	// 等待读 goroutine 完全退出，避免泄漏
+	c.wg.Wait()
+	return err
 }
 
 func (c *MCPClient) IsConnected() bool { return c.transport.IsConnected() }
@@ -65,9 +91,10 @@ func (c *MCPClient) NextID() string {
 }
 
 func (c *MCPClient) readLoop() {
+	defer c.wg.Done()
 	for msg := range c.transport.Recv() {
 		if c.closed.Load() {
-			return
+			break
 		}
 		if isJSONArray(msg) {
 			var arr []json.RawMessage
@@ -83,12 +110,16 @@ func (c *MCPClient) readLoop() {
 		}
 	}
 
-	// Recv 关闭：说明 Transport 真正关闭，清理 pending
+	// Transport Recv 关闭时，清理所有 pending
 	c.failAllPending(&TransportError{Op: "recv", Err: ErrTransportClosed, Temporary: false})
+
+	// 调用 Hook
+	if c.hooks != nil && c.hooks.OnDisconnect != nil {
+		c.hooks.OnDisconnect(false)
+	}
 }
 
 func (c *MCPClient) dispatchOne(raw json.RawMessage) {
-	// 可能是 Response 或 Notification
 	var probe struct {
 		JSONRPC string           `json:"jsonrpc"`
 		ID      *string          `json:"id,omitempty"`
@@ -108,16 +139,22 @@ func (c *MCPClient) dispatchOne(raw json.RawMessage) {
 	// 内部断线通知：清理所有 pending
 	if probe.ID == nil && probe.Method == InternalDisconnectedMethod {
 		c.failAllPending(&TransportError{Op: "recv", Err: ErrTransportClosed, Temporary: true})
+		if c.hooks != nil && c.hooks.OnDisconnect != nil {
+			c.hooks.OnDisconnect(true)
+		}
 		return
 	}
 
+	// Notification
 	if probe.ID == nil && probe.Method != "" {
-		// Notification
 		c.notifyMu.RLock()
 		cb := c.onNotify
 		c.notifyMu.RUnlock()
 		if cb != nil && probe.Params != nil {
 			cb(probe.Method, *probe.Params)
+		}
+		if c.hooks != nil && c.hooks.OnNotify != nil {
+			c.hooks.OnNotify(probe.Method)
 		}
 		return
 	}
@@ -145,6 +182,10 @@ func (c *MCPClient) dispatchOne(raw json.RawMessage) {
 			log.Printf("response channel full for id %s", *resp.ID)
 		}
 	}
+
+	if c.hooks != nil && c.hooks.OnResponse != nil {
+		c.hooks.OnResponse(*resp.ID, resp.Error)
+	}
 }
 
 func (c *MCPClient) failAllPending(err error) {
@@ -156,7 +197,7 @@ func (c *MCPClient) failAllPending(err error) {
 			JSONRPC: JsonrpcVersion,
 			ID:      &id,
 			Error: &RPCError{
-				Code:    -32000, // JSON-RPC Server error 范围
+				Code:    ClientTransportClosedCode,
 				Message: err.Error(),
 			},
 		}:
@@ -194,6 +235,10 @@ func (c *MCPClient) sendAndWait(ctx context.Context, req *RPCRequest) (*RPCRespo
 		delete(c.pending, id)
 		c.pendingMu.Unlock()
 		return nil, err
+	}
+
+	if c.hooks != nil && c.hooks.OnSend != nil {
+		c.hooks.OnSend(id, req.Method)
 	}
 
 	// 等待响应或超时
@@ -248,7 +293,7 @@ func (c *MCPClient) Notify(ctx context.Context, method string, params any) error
 	return c.transport.Send(ctx, MustJSON(req))
 }
 
-// CallBatch：去掉 N 个 goroutine；统一收集响应，避免 goroutine 爆炸
+// CallBatch：使用轮询等待响应，避免 goroutine 爆炸
 func (c *MCPClient) CallBatch(ctx context.Context, batch []RPCRequest) ([]RPCResponse, error) {
 	for i := range batch {
 		batch[i].JSONRPC = JsonrpcVersion
@@ -285,8 +330,10 @@ func (c *MCPClient) CallBatch(ctx context.Context, batch []RPCRequest) ([]RPCRes
 	out := make([]RPCResponse, len(batch))
 	left := len(batch)
 
+	ticker := time.NewTicker(13 * time.Millisecond) // 改进：替代 time.After
+	defer ticker.Stop()
+
 	for left > 0 {
-		// 简单轮询等待（不新增 goroutine）
 		c.pendingMu.Lock()
 		for i := range batch {
 			id := *batch[i].ID
@@ -327,7 +374,7 @@ func (c *MCPClient) CallBatch(ctx context.Context, batch []RPCRequest) ([]RPCRes
 			}
 			c.pendingMu.Unlock()
 			return out, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 	return out, nil
