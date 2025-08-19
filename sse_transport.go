@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -41,7 +40,8 @@ func NewSSETransport(postURL string, opts *DialOptions) (*SSETransport, error) {
 	}
 	opt := opts.WithDefaults()
 	if opt.SSEEventsURL == "" {
-		return nil, errors.New("SSE requires DialOptions.SSEEventsURL")
+		// 若未指定，则使用 POST URL一样的路径
+		opt.SSEEventsURL = postURL
 	}
 	t := &SSETransport{
 		postURL:   postURL,
