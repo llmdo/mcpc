@@ -441,7 +441,10 @@ func (t *SSETransport) eventLoop() {
 		resp, err := t.client.Do(req)
 		if err != nil {
 			// 连接失败：发内部通知，回调，然后退避重连
-			select { case t.recvC <- makeInternalDisconnectedNote(err): default: }
+			select {
+			case t.recvC <- makeInternalDisconnectedNote(err):
+			default:
+			}
 			if t.opts.OnDisconnected != nil {
 				t.opts.OnDisconnected(err)
 			}
@@ -460,7 +463,10 @@ func (t *SSETransport) eventLoop() {
 			defer resp.Body.Close()
 			if resp.StatusCode/100 != 2 {
 				err = fmt.Errorf("SSE bad status: %s", resp.Status)
-				select { case t.recvC <- makeInternalDisconnectedNote(err): default: }
+				select {
+				case t.recvC <- makeInternalDisconnectedNote(err):
+				default:
+				}
 				if t.opts.OnDisconnected != nil {
 					t.opts.OnDisconnected(err)
 				}
@@ -481,7 +487,10 @@ func (t *SSETransport) eventLoop() {
 				if err != nil {
 					if !errors.Is(err, io.EOF) {
 						// 非 EOF 也算断线
-						select { case t.recvC <- makeInternalDisconnectedNote(err): default: }
+						select {
+						case t.recvC <- makeInternalDisconnectedNote(err):
+						default:
+						}
 						if t.opts.OnDisconnected != nil {
 							t.opts.OnDisconnected(err)
 						}
@@ -533,7 +542,10 @@ func (t *SSETransport) Send(ctx context.Context, payload []byte) error {
 	}
 	if err != nil {
 		// 发送失败：视作临时传输错误
-		select { case t.recvC <- makeInternalDisconnectedNote(err): default: }
+		select {
+		case t.recvC <- makeInternalDisconnectedNote(err):
+		default:
+		}
 		if t.opts.OnDisconnected != nil {
 			t.opts.OnDisconnected(err)
 		}
@@ -1042,15 +1054,15 @@ func main() {
 	mode := envStr("MCP_MODE", "SSE") // WS | SSE | STDIO
 
 	opts := (&DialOptions{
-		AuthToken:             envStr("MCP_TOKEN", ""),
-		RequestTimeout:        10 * time.Second,
-		PingInterval:          10 * time.Second,
-		PongWait:              30 * time.Second,
-		InsecureSkipVerify:    true, // demo
-		Headers:               http.Header{"X-Client": []string{"go-mcp-demo"}},
-		OnDisconnected:        func(e error) { log.Printf("[transport] disconnected: %v", e) },
-		OnReconnected:         func() { log.Printf("[transport] reconnected") },
-		MaxRetries:            3,
+		AuthToken:               envStr("MCP_TOKEN", "MCP_TOKEN-12345679"),
+		RequestTimeout:          1000 * time.Second,
+		PingInterval:            10 * time.Second,
+		PongWait:                3000 * time.Second,
+		InsecureSkipVerify:      true, // demo
+		Headers:                 http.Header{"X-Client": []string{"go-mcp-demo"}},
+		OnDisconnected:          func(e error) { log.Printf("[transport] disconnected: %v", e) },
+		OnReconnected:           func() { log.Printf("[transport] reconnected") },
+		MaxRetries:              3,
 		ReconnectInitialBackoff: 500 * time.Millisecond,
 		ReconnectMaxBackoff:     8 * time.Second,
 	}).withDefaults()
@@ -1144,6 +1156,8 @@ func main() {
 			log.Printf("  [%s] EMPTY", *resp.ID)
 		}
 	}
+
+	time.Sleep(10000 * time.Second)
 }
 
 func envStr(k, def string) string {
