@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,6 +31,8 @@ type SSETransport struct {
 	alive  atomic.Bool
 	stopCh chan struct{}
 	wg     sync.WaitGroup
+
+	reconnector *Reconnector
 }
 
 func NewSSETransport(postURL string, opts *DialOptions) (*SSETransport, error) {
@@ -47,137 +48,113 @@ func NewSSETransport(postURL string, opts *DialOptions) (*SSETransport, error) {
 		recvC:     make(chan []byte, 256),
 		stopCh:    make(chan struct{}),
 	}
-	t.alive.Store(true)
+	t.reconnector = NewReconnector(opt)
+
+	// start manager
 	t.wg.Add(1)
-	go t.eventLoop()
+	go func() {
+		defer t.wg.Done()
+		t.reconnector.Manage(t.connectAndServe, t.recvC, &t.alive, t.stopCh)
+	}()
 	return t, nil
 }
 
-func (t *SSETransport) eventLoop() {
-	defer t.wg.Done()
-	backoff := t.opts.ReconnectInitialBackoff
+func (t *SSETransport) connectAndServe(connected chan<- struct{}) error {
+	opt := t.opts
+
+	req, _ := http.NewRequestWithContext(opt.CancelCtx, http.MethodGet, t.eventsURL, nil)
+	req.Header = opt.Headers.Clone()
+
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("SSE bad status: %s", resp.Status)
+	}
+
+	// connected
+	select {
+	case connected <- struct{}{}:
+	default:
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var dataLines []string
 
 	for {
 		select {
 		case <-t.stopCh:
-			close(t.recvC)
-			return
+			return nil
 		default:
 		}
 
-		req, _ := http.NewRequestWithContext(context.Background(), "GET", t.eventsURL, nil)
-		req.Header = t.opts.Headers.Clone()
-
-		resp, err := t.client.Do(req)
+		line, err := reader.ReadString('\n')
 		if err != nil {
-			// 连接失败：发内部通知，回调，然后退避重连
-			select {
-			case t.recvC <- makeInternalDisconnectedNote(err):
-			default:
+			return err
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			if len(dataLines) > 0 {
+				full := strings.Join(dataLines, "\n")
+				dataLines = nil
+				if full != "" {
+					if opt.OnMessage != nil {
+						opt.OnMessage([]byte(full))
+					}
+					select {
+					case t.recvC <- []byte(full):
+					case <-t.stopCh:
+						return nil
+					}
+				}
 			}
-			if t.opts.OnDisconnected != nil {
-				t.opts.OnDisconnected(err)
-			}
-			time.Sleep(backoff)
-			backoff = time.Duration(math.Min(float64(t.opts.ReconnectMaxBackoff), float64(backoff)*1.8))
 			continue
 		}
-
-		// 成功连接
-		if t.opts.OnReconnected != nil {
-			t.opts.OnReconnected()
+		if strings.HasPrefix(line, "data:") {
+			dataContent := strings.TrimSpace(line[5:])
+			dataLines = append(dataLines, dataContent)
 		}
-		backoff = t.opts.ReconnectInitialBackoff
-
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode/100 != 2 {
-				err = fmt.Errorf("SSE bad status: %s", resp.Status)
-				select {
-				case t.recvC <- makeInternalDisconnectedNote(err):
-				default:
-				}
-				if t.opts.OnDisconnected != nil {
-					t.opts.OnDisconnected(err)
-				}
-				return
-			}
-
-			reader := bufio.NewReader(resp.Body)
-			var dataLines []string
-
-			for {
-				select {
-				case <-t.stopCh:
-					return
-				default:
-				}
-
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					if !errors.Is(err, io.EOF) {
-						// 非 EOF 也算断线
-						select {
-						case t.recvC <- makeInternalDisconnectedNote(err):
-						default:
-						}
-						if t.opts.OnDisconnected != nil {
-							t.opts.OnDisconnected(err)
-						}
-					}
-					return
-				}
-				line = strings.TrimRight(line, "\r\n")
-				if line == "" {
-					if len(dataLines) > 0 {
-						full := strings.Join(dataLines, "\n")
-						dataLines = nil
-						if full != "" {
-							select {
-							case t.recvC <- []byte(full):
-							case <-t.stopCh:
-								return
-							}
-						}
-					}
-					continue
-				}
-				if strings.HasPrefix(line, "data:") {
-					dataContent := strings.TrimSpace(line[5:])
-					dataLines = append(dataLines, dataContent)
-				}
-			}
-		}()
-		// 走到这里说明需要重连
 	}
 }
-
 func (t *SSETransport) Send(ctx context.Context, payload []byte) error {
+	opt := t.opts
+	// if not connected, wait for reconnect (controlled by ctx)
 	if !t.alive.Load() {
-		return &TransportError{Op: "write", Err: ErrTransportClosed, Temporary: true}
+		if !t.reconnector.WaitForReconnect(ctx) {
+			return &TransportError{Op: "write", Err: ErrTransportClosed, Temporary: true}
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", t.postURL, bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	req.Header = t.opts.Headers.Clone()
 
 	var resp *http.Response
-	for i := 0; i < t.opts.MaxRetries; i++ {
+	var err error
+	for i := 0; i < opt.MaxRetries; i++ {
+		req, rerr := http.NewRequestWithContext(ctx, "POST", t.postURL, bytes.NewReader(payload))
+		if rerr != nil {
+			return rerr
+		}
+		req.Header = opt.Headers.Clone()
 		resp, err = t.client.Do(req)
 		if err == nil {
 			break
 		}
-		time.Sleep(time.Duration(i+1) * 300 * time.Millisecond)
+		select {
+		case <-time.After(time.Duration(i+1) * 300 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.stopCh:
+			return ErrTransportClosed
+		}
 	}
 	if err != nil {
-		// 发送失败：视作临时传输错误
 		select {
 		case t.recvC <- makeInternalDisconnectedNote(err):
 		default:
 		}
-		if t.opts.OnDisconnected != nil {
-			t.opts.OnDisconnected(err)
+		if opt.OnDisconnected != nil {
+			opt.OnDisconnected(err)
 		}
 		return &TransportError{Op: "write", Err: err, Temporary: true}
 	}
@@ -193,11 +170,16 @@ func (t *SSETransport) Send(ctx context.Context, payload []byte) error {
 func (t *SSETransport) Recv() <-chan []byte { return t.recvC }
 
 func (t *SSETransport) Close() error {
-	if !t.alive.Swap(false) {
-		return nil
+	select {
+	case <-t.stopCh:
+	default:
+		close(t.stopCh)
 	}
-	close(t.stopCh)
 	t.wg.Wait()
+	select {
+	default:
+		close(t.recvC)
+	}
 	return nil
 }
 

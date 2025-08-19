@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"github.com/gorilla/websocket"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,176 +19,148 @@ type WebSocketTransport struct {
 	url  string
 	opts *DialOptions
 
-	conn    *websocket.Conn
-	muW     sync.Mutex
-	recvC   chan []byte
-	alive   atomic.Bool
-	closed  atomic.Bool
-	closeMu sync.Mutex
-	once    sync.Once
+	conn   *websocket.Conn
+	muW    sync.Mutex
+	recvC  chan []byte
+	alive  atomic.Bool
+	stopCh chan struct{}
+	wg     sync.WaitGroup
 
-	// 控制
-	stopCh       chan struct{}
-	reconnectedC chan struct{}
-	wg           sync.WaitGroup
+	reconnector *Reconnector
 }
 
 func NewWebSocketTransport(urlStr string, opts *DialOptions) (*WebSocketTransport, error) {
+	opt := opts.WithDefaults()
 	t := &WebSocketTransport{
-		url:          urlStr,
-		opts:         opts.WithDefaults(),
-		recvC:        make(chan []byte, 256),
-		stopCh:       make(chan struct{}),
-		reconnectedC: make(chan struct{}, 1),
+		url:         urlStr,
+		opts:        opt,
+		recvC:       make(chan []byte, 256),
+		stopCh:      make(chan struct{}),
+		reconnector: NewReconnector(opt),
 	}
-	if err := t.connect(); err != nil {
-		return nil, err
-	}
+	// start manager
 	t.wg.Add(1)
-	go t.loop()
+	go func() {
+		defer t.wg.Done()
+		t.reconnector.Manage(t.connectAndServe, t.recvC, &t.alive, t.stopCh)
+	}()
 	return t, nil
 }
 
-func (t *WebSocketTransport) connect() error {
+func (t *WebSocketTransport) connectAndServe(connected chan<- struct{}) error {
+	opt := t.opts
 	dialer := websocket.Dialer{
 		HandshakeTimeout:  15 * time.Second,
 		EnableCompression: true,
-		TLSClientConfig:   &tls.Config{InsecureSkipVerify: t.opts.InsecureSkipVerify},
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: opt.InsecureSkipVerify},
 	}
-	conn, _, err := dialer.Dial(t.url, t.opts.Headers)
+	conn, _, err := dialer.Dial(t.url, opt.Headers)
 	if err != nil {
 		return err
 	}
 	t.conn = conn
-	t.alive.Store(true)
 
-	_ = t.conn.SetReadDeadline(time.Now().Add(t.opts.PongWait))
+	_ = t.conn.SetReadDeadline(time.Now().Add(opt.PongWait))
 	t.conn.SetPongHandler(func(string) error {
-		_ = t.conn.SetReadDeadline(time.Now().Add(t.opts.PongWait))
+		_ = t.conn.SetReadDeadline(time.Now().Add(opt.PongWait))
 		return nil
 	})
-	return nil
-}
 
-func (t *WebSocketTransport) loop() {
-	defer t.wg.Done()
+	select {
+	case connected <- struct{}{}:
+	default:
+	}
 
-	// 心跳
-	t.wg.Add(1)
+	// ping goroutine
+	pingStop := make(chan struct{})
+	var pingWg sync.WaitGroup
+	pingWg.Add(1)
 	go func() {
-		defer t.wg.Done()
-		ticker := time.NewTicker(t.opts.PingInterval)
+		defer pingWg.Done()
+		ticker := time.NewTicker(opt.PingInterval)
 		defer ticker.Stop()
+		consecutiveFailures := 0
+		threshold := opt.PingFailureThreshold
+		if threshold <= 0 {
+			threshold = 3
+		}
 		for {
 			select {
 			case <-ticker.C:
-				if !t.alive.Load() {
-					continue
-				}
 				t.muW.Lock()
 				err := t.conn.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(5*time.Second))
 				t.muW.Unlock()
 				if err != nil {
-					t.onDisconnect(&TransportError{Op: "ping", Err: err, Temporary: true})
+					consecutiveFailures++
+					if consecutiveFailures >= threshold {
+						_ = t.conn.Close()
+						return
+					}
+				} else {
+					consecutiveFailures = 0
 				}
+			case <-pingStop:
+				return
 			case <-t.stopCh:
+				return
+			case <-opt.CancelCtx.Done():
 				return
 			}
 		}
 	}()
 
-	// 读
-	for {
-		if !t.alive.Load() {
-			// 阻塞等待重连或关闭
-			select {
-			case <-t.reconnectedC:
-				// 重连成功，继续读
-			case <-t.stopCh:
-				close(t.recvC)
-				return
-			}
+	// stop monitor
+	go func() {
+		select {
+		case <-t.stopCh:
+			_ = t.conn.Close()
+		case <-opt.CancelCtx.Done():
+			_ = t.conn.Close()
 		}
+	}()
 
+	for {
 		_, msg, err := t.conn.ReadMessage()
 		if err != nil {
-			t.onDisconnect(&TransportError{Op: "read", Err: err, Temporary: true})
-			continue
+			close(pingStop)
+			pingWg.Wait()
+			_ = t.conn.Close()
+			t.conn = nil
+			return err
+		}
+		if opt.OnMessage != nil {
+			opt.OnMessage(msg)
 		}
 		select {
 		case t.recvC <- msg:
 		case <-t.stopCh:
-			close(t.recvC)
-			return
+			close(pingStop)
+			pingWg.Wait()
+			return nil
 		}
-	}
-}
-
-func (t *WebSocketTransport) onDisconnect(cause error) {
-	if !t.alive.Swap(false) {
-		return
-	}
-	// 关闭旧连接
-	if t.conn != nil {
-		_ = t.conn.Close()
-	}
-	// 通知上层（内部通知 + 回调）
-	select {
-	case t.recvC <- makeInternalDisconnectedNote(cause):
-	default:
-	}
-	if t.opts.OnDisconnected != nil {
-		t.opts.OnDisconnected(cause)
-	}
-
-	// 重连
-	go t.reconnectLoop()
-}
-
-func (t *WebSocketTransport) reconnectLoop() {
-	backoff := t.opts.ReconnectInitialBackoff
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-		}
-
-		err := t.connect()
-		if err == nil {
-			// 成功
-			if t.opts.OnReconnected != nil {
-				t.opts.OnReconnected()
-			}
-			t.alive.Store(true)
-			select { // 非阻塞唤醒读循环
-			case t.reconnectedC <- struct{}{}:
-			default:
-			}
-			return
-		}
-		// 退避
-		time.Sleep(backoff)
-		backoff = time.Duration(math.Min(float64(t.opts.ReconnectMaxBackoff), float64(backoff)*1.8))
 	}
 }
 
 func (t *WebSocketTransport) Send(ctx context.Context, payload []byte) error {
 	if !t.alive.Load() {
-		return &TransportError{Op: "write", Err: ErrTransportClosed, Temporary: true}
+		// wait for reconnect (controlled by caller ctx)
+		if !t.reconnector.WaitForReconnect(ctx) {
+			return &TransportError{Op: "write", Err: ErrTransportClosed, Temporary: true}
+		}
 	}
+
 	t.muW.Lock()
 	defer t.muW.Unlock()
-
-	deadline, ok := ctx.Deadline()
-	if ok {
-		_ = t.conn.SetWriteDeadline(deadline)
+	if t.conn == nil {
+		return &TransportError{Op: "write", Err: ErrTransportClosed, Temporary: true}
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = t.conn.SetWriteDeadline(dl)
 	} else {
 		_ = t.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	}
 	if err := t.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		// 写失败也触发断开并进入重连
-		t.onDisconnect(err)
+		_ = t.conn.Close()
 		return &TransportError{Op: "write", Err: err, Temporary: true}
 	}
 	return nil
@@ -198,17 +169,20 @@ func (t *WebSocketTransport) Send(ctx context.Context, payload []byte) error {
 func (t *WebSocketTransport) Recv() <-chan []byte { return t.recvC }
 
 func (t *WebSocketTransport) Close() error {
-	t.closeMu.Lock()
-	defer t.closeMu.Unlock()
-	if t.closed.Load() {
-		return nil
-	}
-	t.closed.Store(true)
-	close(t.stopCh)
-	if t.conn != nil {
-		_ = t.conn.Close()
+	select {
+	case <-t.stopCh:
+	default:
+		close(t.stopCh)
 	}
 	t.wg.Wait()
+	if t.conn != nil {
+		_ = t.conn.Close()
+		t.conn = nil
+	}
+	select {
+	default:
+		close(t.recvC)
+	}
 	return nil
 }
 

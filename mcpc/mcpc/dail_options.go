@@ -1,6 +1,7 @@
 package mcpc
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -21,9 +22,13 @@ type DialOptions struct {
 	PingInterval time.Duration
 	PongWait     time.Duration
 
-	// 回调
+	// 回调（已有）
 	OnDisconnected func(error)
 	OnReconnected  func()
+
+	// New hooks (增加)
+	OnMessage          func([]byte)                             // 每条收到的消息（transport 层）
+	OnReconnectAttempt func(attempt int, backoff time.Duration) // 每次尝试重连时触发（用于 metrics / debug）
 
 	// TLS / Transport
 	InsecureSkipVerify bool
@@ -40,6 +45,13 @@ type DialOptions struct {
 	// 重连策略
 	ReconnectInitialBackoff time.Duration // e.g. 500ms
 	ReconnectMaxBackoff     time.Duration // e.g. 10s
+
+	// CancelCtx allows caller to cancel all reconnect attempts and in-flight connect requests.
+	CancelCtx context.Context
+
+	// PingFailureThreshold indicates how many consecutive ping write failures are tolerated before
+	// declaring the connection unhealthy and closing it to trigger a reconnect. Default: 3
+	PingFailureThreshold int
 }
 
 func (o *DialOptions) WithDefaults() *DialOptions {
@@ -61,6 +73,12 @@ func (o *DialOptions) WithDefaults() *DialOptions {
 	}
 	if cp.ReconnectMaxBackoff <= 0 {
 		cp.ReconnectMaxBackoff = 10 * time.Second
+	}
+	if cp.PingFailureThreshold <= 0 {
+		cp.PingFailureThreshold = 3
+	}
+	if cp.CancelCtx == nil {
+		cp.CancelCtx = context.Background()
 	}
 	if cp.HTTPClient == nil {
 		tr := &http.Transport{
