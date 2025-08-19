@@ -58,7 +58,7 @@ func (c *MCPClient) SetNotificationHandler(h NotificationHandler) {
 	c.notifyMu.Unlock()
 }
 
-func (c *MCPClient) nextID() string {
+func (c *MCPClient) NextID() string {
 	var b [12]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:]) + "-" + strconv.FormatUint(c.seq.Add(1), 10)
@@ -101,7 +101,7 @@ func (c *MCPClient) dispatchOne(raw json.RawMessage) {
 		log.Printf("dispatch unmarshal error: %v", err)
 		return
 	}
-	if probe.JSONRPC != jsonrpcVersion {
+	if probe.JSONRPC != JsonrpcVersion {
 		return
 	}
 
@@ -153,7 +153,7 @@ func (c *MCPClient) failAllPending(err error) {
 	for id, ch := range c.pending {
 		select {
 		case ch <- &RPCResponse{
-			JSONRPC: jsonrpcVersion,
+			JSONRPC: JsonrpcVersion,
 			ID:      &id,
 			Error: &RPCError{
 				Code:    -32000, // JSON-RPC Server error 范围
@@ -168,7 +168,7 @@ func (c *MCPClient) failAllPending(err error) {
 
 func (c *MCPClient) sendAndWait(ctx context.Context, req *RPCRequest) (*RPCResponse, error) {
 	if req.JSONRPC == "" {
-		req.JSONRPC = jsonrpcVersion
+		req.JSONRPC = JsonrpcVersion
 	}
 	if req.ID != nil && *req.ID == "" {
 		req.ID = nil
@@ -212,7 +212,7 @@ func (c *MCPClient) sendAndWait(ctx context.Context, req *RPCRequest) (*RPCRespo
 }
 
 func (c *MCPClient) Call(ctx context.Context, method string, params any) (*RPCResponse, error) {
-	id := c.nextID()
+	id := c.NextID()
 	var p *json.RawMessage
 	if params != nil {
 		if raw, ok := params.(json.RawMessage); ok {
@@ -224,7 +224,7 @@ func (c *MCPClient) Call(ctx context.Context, method string, params any) (*RPCRe
 		}
 	}
 	req := &RPCRequest{
-		JSONRPC: jsonrpcVersion,
+		JSONRPC: JsonrpcVersion,
 		ID:      &id,
 		Method:  method,
 		Params:  p,
@@ -244,16 +244,16 @@ func (c *MCPClient) Notify(ctx context.Context, method string, params any) error
 		r := json.RawMessage(bs)
 		p = &r
 	}
-	req := &RPCRequest{JSONRPC: jsonrpcVersion, Method: method, Params: p}
-	return c.transport.Send(ctx, mustJSON(req))
+	req := &RPCRequest{JSONRPC: JsonrpcVersion, Method: method, Params: p}
+	return c.transport.Send(ctx, MustJSON(req))
 }
 
 // CallBatch：去掉 N 个 goroutine；统一收集响应，避免 goroutine 爆炸
 func (c *MCPClient) CallBatch(ctx context.Context, batch []RPCRequest) ([]RPCResponse, error) {
 	for i := range batch {
-		batch[i].JSONRPC = jsonrpcVersion
+		batch[i].JSONRPC = JsonrpcVersion
 		if batch[i].ID == nil {
-			id := c.nextID()
+			id := c.NextID()
 			batch[i].ID = &id
 		}
 	}
@@ -315,7 +315,7 @@ func (c *MCPClient) CallBatch(ctx context.Context, batch []RPCRequest) ([]RPCRes
 				id := *batch[i].ID
 				if _, ok := respMap[id]; ok {
 					out[i] = RPCResponse{
-						JSONRPC: jsonrpcVersion,
+						JSONRPC: JsonrpcVersion,
 						ID:      &id,
 						Error: &RPCError{
 							Code:    -1,

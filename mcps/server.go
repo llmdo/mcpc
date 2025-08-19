@@ -385,7 +385,7 @@ func main() {
 	// WS（独立端口）
 	http.HandleFunc("/mcp/ws", wsHandler)
 	go func() {
-		addrWS := ":8081"
+		addrWS := ":18081"
 		log.Printf("WS server on %s", addrWS)
 		log.Fatal(http.ListenAndServe(addrWS, nil))
 	}()
@@ -395,7 +395,7 @@ func main() {
 	mux.HandleFunc("/mcp/events", sseEvents)
 	mux.HandleFunc("/mcp", ssePost)
 
-	addr := ":8080"
+	addr := ":18080"
 	log.Printf("HTTP(SSE) server on %s", addr)
 	log.Fatal(http.ListenAndServe(addr, mux))
 }

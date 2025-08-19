@@ -9,7 +9,7 @@ import (
    JSON-RPC 2.0 基础类型
    ========================= */
 
-const jsonrpcVersion = "2.0"
+const JsonrpcVersion = "2.0"
 
 type RPCRequest struct {
 	JSONRPC string           `json:"jsonrpc"`

@@ -10,7 +10,7 @@ import (
    工具函数
    ========================= */
 
-func mustJSON(v any) []byte {
+func MustJSON(v any) []byte {
 	bs, _ := json.Marshal(v)
 	return bs
 }

@@ -24,7 +24,7 @@ const InternalDisconnectedMethod = "$transport/disconnected"
 
 func makeInternalDisconnectedNote(err error) []byte {
 	msg := map[string]any{
-		"jsonrpc": jsonrpcVersion,
+		"jsonrpc": JsonrpcVersion,
 		"method":  InternalDisconnectedMethod,
 		"params":  map[string]any{"error": err.Error()},
 	}
