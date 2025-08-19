@@ -26,7 +26,7 @@ func main() {
 		ReconnectMaxBackoff:     8 * time.Second,
 	}).WithDefaults()
 	// 初始化 WS 传输层
-	transport, err := mcpc.NewWebSocketTransport("ws://localhost:8080/mcp", opts)
+	transport, err := mcpc.NewWebSocketTransport("ws://localhost:18081/mcp/ws", opts)
 	if err != nil {
 		log.Fatalf("new sse transport: %v", err)
 	}
@@ -43,28 +43,29 @@ func main() {
 		},
 	}
 
-	client := mcpc.NewMCPClient(transport, &mcpc.DialOptions{
-		RequestTimeout: 5 * time.Second,
-	}, hooks)
+	client := mcpc.NewMCPClient(transport, opts, hooks)
 	defer client.Close()
 
 	// RPC 调用
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	resp, err := client.Call(ctx, "echo", map[string]string{"msg": "hello ws"})
-	if err != nil {
-		log.Fatalf("call failed: %v", err)
+	tools := []string{"echo", "reverse", "uppercase"}
+	var batch []mcpc.RPCRequest
+	for _, tool := range tools {
+		id := client.NextID()
+		params := map[string]any{"message": "batch test"}
+		paramsRaw, _ := json.Marshal(params)
+		payload := map[string]any{"name": tool, "params": json.RawMessage(paramsRaw)}
+		payloadRaw := json.RawMessage(mcpc.MustJSON(payload))
+		batch = append(batch, mcpc.RPCRequest{
+			JSONRPC: mcpc.JsonrpcVersion,
+			ID:      &id,
+			Method:  "tools/call",
+			Params:  &payloadRaw,
+		})
 	}
-	fmt.Println("echo resp:", string(*resp.Result))
-
-	Pa := json.RawMessage(mcpc.MustJSON(map[string]string{"msg": "batch"}))
-	// 批量调用
-	batch := []mcpc.RPCRequest{
-		{Method: "ping"},
-		{Method: "echo", Params: &Pa},
-	}
-	resps, _ := client.CallBatch(context.Background(), batch)
+	resps, _ := client.CallBatch(ctx, batch)
 	for _, r := range resps {
 		fmt.Println("batch resp:", r)
 	}
