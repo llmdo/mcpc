@@ -1,12 +1,8 @@
 // server.go
-// 功能：JSON-RPC 2.0 + MCP Demo 服务端
-// - 支持 WebSocket:   ws://localhost:8081/mcp/ws
-// - 支持 SSE：        POST http://localhost:8080/mcp  +  GET http://localhost:8080/mcp/events
-// - 鉴权与路由：使用 "Authorization: Bearer <token>" 作为 clientID
-// - 订阅者分区：SSE 每个 token 一个订阅者通道；WS 每个连接绑定一个 token
-//
-// 注意：为简化 Demo，这里不做持久化与复杂鉴权逻辑。
-//      生产中请替换为真正的鉴权、连接管理与响应路由。
+// 改进版 MCP Demo Server
+// - 支持 WS 和 SSE
+// - 使用 JSON-RPC 2.0
+// - 简单鉴权 (Bearer <token> 作为 clientID)
 
 package main
 
@@ -49,16 +45,17 @@ type rpcErr struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
-/* =========================
-   简单工具实现（echo / reverse / uppercase）
-   ========================= */
-
+// 工具返回结构
 type toolsListResult struct {
 	Tools []struct {
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
 	} `json:"tools"`
 }
+
+/* =========================
+   工具实现
+   ========================= */
 
 func handleToolsList(id *string) *rpcResp {
 	result := toolsListResult{
@@ -77,14 +74,18 @@ func handleToolsList(id *string) *rpcResp {
 }
 
 func handleToolsCall(id *string, params *json.RawMessage) *rpcResp {
-	// 期望 params 形如：{"name":"echo","params":{"message":"..."}}
+	if params == nil {
+		return rpcError(id, -32602, "Invalid params")
+	}
+
 	var p struct {
 		Name   string           `json:"name"`
 		Params *json.RawMessage `json:"params"`
 	}
-	if params == nil || json.Unmarshal(*params, &p) != nil {
-		return &rpcResp{JSONRPC: jsonrpcVersion, ID: id, Error: &rpcErr{Code: -32602, Message: "Invalid params"}}
+	if err := json.Unmarshal(*params, &p); err != nil {
+		return rpcError(id, -32700, "Parse error")
 	}
+
 	var pp struct {
 		Message string `json:"message"`
 	}
@@ -92,10 +93,13 @@ func handleToolsCall(id *string, params *json.RawMessage) *rpcResp {
 		_ = json.Unmarshal(*p.Params, &pp)
 	}
 
+	if pp.Message == "" {
+		return rpcError(id, -32602, "missing param: message")
+	}
+
 	out := pp.Message
 	switch strings.ToLower(p.Name) {
 	case "echo":
-		// 不变
 	case "reverse":
 		r := []rune(out)
 		for i, j := 0, len(r)-1; i < j; i, j = i+1, j-1 {
@@ -105,30 +109,42 @@ func handleToolsCall(id *string, params *json.RawMessage) *rpcResp {
 	case "uppercase":
 		out = strings.ToUpper(out)
 	default:
-		return &rpcResp{JSONRPC: jsonrpcVersion, ID: id, Error: &rpcErr{Code: -32601, Message: "Unknown tool"}}
+		return rpcError(id, -32601, "Unknown tool")
 	}
+
 	b, _ := json.Marshal(map[string]any{"output": out})
 	raw := json.RawMessage(b)
 	return &rpcResp{JSONRPC: jsonrpcVersion, ID: id, Result: &raw}
 }
 
 func dispatchRPC(req *rpcReq) *rpcResp {
+	if req.JSONRPC != jsonrpcVersion {
+		return rpcError(req.ID, -32600, "Invalid Request")
+	}
+
 	switch req.Method {
 	case "tools/list":
 		return handleToolsList(req.ID)
 	case "tools/call":
 		return handleToolsCall(req.ID, req.Params)
 	default:
-		// notification 或未知方法
 		if req.ID == nil {
 			return nil
 		}
-		return &rpcResp{JSONRPC: jsonrpcVersion, ID: req.ID, Error: &rpcErr{Code: -32601, Message: "Method not found"}}
+		return rpcError(req.ID, -32601, "Method not found")
+	}
+}
+
+func rpcError(id *string, code int, msg string) *rpcResp {
+	return &rpcResp{
+		JSONRPC: jsonrpcVersion,
+		ID:      id,
+		Error:   &rpcErr{Code: code, Message: msg},
 	}
 }
 
 /* =========================
-   鉴权与 ClientID
+   鉴权
    ========================= */
 
 func extractClientIDFromAuth(r *http.Request) (string, error) {
@@ -140,11 +156,11 @@ func extractClientIDFromAuth(r *http.Request) (string, error) {
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
 		return "", errors.New("invalid Authorization header")
 	}
-	return parts[1], nil // 直接把 token 作为 clientID（demo）
+	return parts[1], nil
 }
 
 /* =========================
-   SSE 实现（按 clientID 分区）
+   SSE
    ========================= */
 
 type sseSubscriber struct {
@@ -154,16 +170,15 @@ type sseSubscriber struct {
 
 var (
 	sseMu   sync.Mutex
-	sseSubs = map[string]*sseSubscriber{} // clientID -> subscriber
+	sseSubs = map[string]*sseSubscriber{}
 )
 
 func sseAdd(clientID string) *sseSubscriber {
 	sseMu.Lock()
 	defer sseMu.Unlock()
-	// 若已存在旧订阅者，先关闭并替换（支持单客户端重连）
 	if old, ok := sseSubs[clientID]; ok {
-		close(old.done)
-		close(old.ch)
+		safeClose(old.done)
+		safeClose(old.ch)
 	}
 	s := &sseSubscriber{
 		ch:   make(chan []byte, 256),
@@ -172,15 +187,17 @@ func sseAdd(clientID string) *sseSubscriber {
 	sseSubs[clientID] = s
 	return s
 }
+
 func sseDel(clientID string) {
 	sseMu.Lock()
 	defer sseMu.Unlock()
 	if s, ok := sseSubs[clientID]; ok {
 		delete(sseSubs, clientID)
-		close(s.done)
-		close(s.ch)
+		safeClose(s.done)
+		safeClose(s.ch)
 	}
 }
+
 func sseSendTo(clientID string, b []byte) {
 	sseMu.Lock()
 	s, ok := sseSubs[clientID]
@@ -191,17 +208,16 @@ func sseSendTo(clientID string, b []byte) {
 	select {
 	case s.ch <- b:
 	default:
+		log.Printf("SSE buffer full for client %s, dropping message", clientID)
 	}
 }
 
 func sseEvents(w http.ResponseWriter, r *http.Request) {
-	// 1) 鉴权：取 clientID
 	clientID, err := extractClientIDFromAuth(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// 2) 建立订阅
 	sub := sseAdd(clientID)
 	defer sseDel(clientID)
 
@@ -209,7 +225,6 @@ func sseEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// 每个客户端独立的心跳/通知
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -228,17 +243,20 @@ func sseEvents(w http.ResponseWriter, r *http.Request) {
 		select {
 		case b := <-sub.ch:
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+				log.Printf("SSE write error: %v", err)
 				return
 			}
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 		case <-ticker.C:
-			_ = writeData(map[string]any{
+			if err := writeData(map[string]any{
 				"jsonrpc": jsonrpcVersion,
 				"method":  "server/ping",
 				"params":  map[string]any{"t": time.Now().Format(time.RFC3339), "clientID": clientID},
-			})
+			}); err != nil {
+				return
+			}
 		case <-r.Context().Done():
 			return
 		case <-sub.done:
@@ -247,7 +265,6 @@ func sseEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /mcp：接收 JSON-RPC（单个或批量），处理后只投递给“同一 clientID”订阅者
 func ssePost(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
@@ -263,10 +280,9 @@ func ssePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 解析并处理
 	if trim[0] == '[' {
 		var reqs []rpcReq
-		if json.Unmarshal(trim, &reqs) != nil {
+		if err := json.Unmarshal(trim, &reqs); err != nil {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
@@ -277,43 +293,35 @@ func ssePost(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		out, _ := json.Marshal(resps)
-		// 精准路由：只发给该 clientID
 		sseSendTo(clientID, out)
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-		return
+	} else {
+		var req rpcReq
+		if err := json.Unmarshal(trim, &req); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		resp := dispatchRPC(&req)
+		out, _ := json.Marshal(resp)
+		sseSendTo(clientID, out)
 	}
-
-	var req rpcReq
-	if json.Unmarshal(trim, &req) != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	resp := dispatchRPC(&req)
-	out, _ := json.Marshal(resp)
-	sseSendTo(clientID, out) // 精准路由
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("ok"))
 }
 
 /* =========================
-   WebSocket 实现（会话级鉴权与路由）
-   - 每条连接绑定一个 clientID
-   - 请求从该连接来，响应也回该连接
+   WebSocket
    ========================= */
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true }, // Demo 放宽跨域
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	// 1) 鉴权
 	clientID, err := extractClientIDFromAuth(r)
 	if err != nil {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	// 2) 升级连接
 	c, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println("upgrade:", err)
@@ -321,7 +329,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.Close()
 
-	// 3) 周期通知（仅对该连接/会话）
 	stop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -334,22 +341,25 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					"method":  "server/ping",
 					"params":  map[string]any{"t": time.Now().Format(time.RFC3339), "clientID": clientID},
 				}
-				_ = c.WriteJSON(notify)
+				if err := c.WriteJSON(notify); err != nil {
+					log.Printf("WS write error: %v", err)
+					close(stop)
+					return
+				}
 			case <-stop:
 				return
 			}
 		}
 	}()
 
-	// 4) 处理来自该会话的请求并直接回写
 	for {
-		var raw json.RawMessage
-		if err := c.ReadJSON(&raw); err != nil {
+		_, msg, err := c.ReadMessage()
+		if err != nil {
+			log.Printf("WS read error: %v", err)
 			close(stop)
-			log.Println("ws read:", err)
 			return
 		}
-		trim := bytes.TrimSpace([]byte(raw))
+		trim := bytes.TrimSpace(msg)
 		if len(trim) == 0 {
 			continue
 		}
@@ -357,6 +367,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		if trim[0] == '[' {
 			var reqs []rpcReq
 			if err := json.Unmarshal(trim, &reqs); err != nil {
+				_ = c.WriteJSON(rpcError(nil, -32700, "Parse error"))
 				continue
 			}
 			var resps []rpcResp
@@ -369,6 +380,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			var req rpcReq
 			if err := json.Unmarshal(trim, &req); err != nil {
+				_ = c.WriteJSON(rpcError(nil, -32700, "Parse error"))
 				continue
 			}
 			resp := dispatchRPC(&req)
@@ -378,11 +390,19 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 /* =========================
-   主函数：同时启动 WS 与 HTTP(SSE)
+   工具函数
+   ========================= */
+
+func safeClose[T any](ch chan T) {
+	defer func() { _ = recover() }()
+	close(ch)
+}
+
+/* =========================
+   主函数
    ========================= */
 
 func main() {
-	// WS（独立端口）
 	http.HandleFunc("/mcp/ws", wsHandler)
 	go func() {
 		addrWS := ":18081"
@@ -390,7 +410,6 @@ func main() {
 		log.Fatal(http.ListenAndServe(addrWS, nil))
 	}()
 
-	// SSE（HTTP）
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp/events", sseEvents)
 	mux.HandleFunc("/mcp", ssePost)
