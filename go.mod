@@ -1,4 +1,4 @@
-module mcpc
+module github.com/llmdo/mcpc
 
 go 1.25.0
 
