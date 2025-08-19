@@ -3,10 +3,11 @@ package mcpc
 import (
 	"context"
 	"crypto/tls"
-	"github.com/gorilla/websocket"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 /* =========================
@@ -30,6 +31,9 @@ type WebSocketTransport struct {
 }
 
 func NewWebSocketTransport(urlStr string, opts *DialOptions) (*WebSocketTransport, error) {
+	if opts == nil {
+		opts = &DialOptions{}
+	}
 	opt := opts.WithDefaults()
 	t := &WebSocketTransport{
 		url:         urlStr,

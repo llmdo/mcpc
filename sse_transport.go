@@ -36,6 +36,9 @@ type SSETransport struct {
 }
 
 func NewSSETransport(postURL string, opts *DialOptions) (*SSETransport, error) {
+	if opts == nil {
+		opts = &DialOptions{}
+	}
 	opt := opts.WithDefaults()
 	if opt.SSEEventsURL == "" {
 		return nil, errors.New("SSE requires DialOptions.SSEEventsURL")

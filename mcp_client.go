@@ -262,6 +262,9 @@ func (c *MCPClient) Call(ctx context.Context, method string, params any) (*RPCRe
 	if params != nil {
 		if raw, ok := params.(json.RawMessage); ok {
 			p = &raw
+		} else if raw, ok := params.([]byte); ok {
+			r := json.RawMessage(raw)
+			p = &r
 		} else {
 			bs, _ := json.Marshal(params)
 			r := json.RawMessage(bs)
