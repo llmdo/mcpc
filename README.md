@@ -14,3 +14,39 @@
 
 ```bash
 go get github.com/llmdo/mcpc
+```
+
+---
+
+## 快速开始
+
+### WebSocket
+
+```go
+transport := mcpc.NewWSTransport("ws://localhost:8080/mcp", nil)
+client := mcpc.NewMCPClient(transport, &mcpc.DialOptions{}, nil)
+defer client.Close()
+
+resp, err := client.Call(context.Background(), "ping", nil)
+```
+
+### SSE
+
+```go
+transport := mcpc.NewSSETransport("http://localhost:8080/mcp", nil)
+client := mcpc.NewMCPClient(transport, &mcpc.DialOptions{}, nil)
+defer client.Close()
+
+_ = client.Notify(context.Background(), "log", map[string]any{"msg": "hello"})
+```
+
+---
+
+## 特性
+
+* `Call`：RPC 请求，带超时
+* `Notify`：通知，不等待返回
+* `CallBatch`：批量请求
+* `Hook`：调试事件
+* `Context`：超时控制 & 强制退出重连
+* `IsConnected`：连接状态检查
