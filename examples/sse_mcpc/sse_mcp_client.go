@@ -55,6 +55,7 @@ func main() {
 	})
 
 	// 发起 RPC 请求
+	// !!! sse示例的方法在ws都可以使用，Call CallBatch ToolsCall ToolsList 都是可用的方法
 	resp, err := client.ToolsCall(context.Background(), "echo", map[string]any{"message": "Hello from MCP client"})
 	if err != nil {
 		log.Fatalf("call failed: %v", err)

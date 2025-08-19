@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -47,15 +46,27 @@ func main() {
 	defer client.Close()
 
 	// RPC 调用
+	// !!! sse示例的方法在ws都可以使用，Call CallBatch ToolsCall ToolsList 都是可用的方法
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	params := map[string]any{"message": "batch test"}
+	paramsRaw, _ := json.Marshal(params)
+
+	payload := map[string]any{"name": "echo", "params": json.RawMessage(paramsRaw)}
+	payloadRaw := json.RawMessage(mcpc.MustJSON(payload))
+	//id := client.NextID()
+	rpcResponse, err := client.Call(ctx, "tools/call", &payloadRaw)
+	if err != nil {
+		log.Printf("[call] err: %v", err)
+	} else {
+		log.Printf("[call] result: %s", string(*rpcResponse.Result))
+	}
 
 	tools := []string{"echo", "reverse", "uppercase"}
 	var batch []mcpc.RPCRequest
 	for _, tool := range tools {
 		id := client.NextID()
-		params := map[string]any{"message": "batch test"}
-		paramsRaw, _ := json.Marshal(params)
 		payload := map[string]any{"name": tool, "params": json.RawMessage(paramsRaw)}
 		payloadRaw := json.RawMessage(mcpc.MustJSON(payload))
 		batch = append(batch, mcpc.RPCRequest{
@@ -67,6 +78,6 @@ func main() {
 	}
 	resps, _ := client.CallBatch(ctx, batch)
 	for _, r := range resps {
-		fmt.Println("batch resp:", r)
+		log.Println("batch resp:", string(*r.Result))
 	}
 }
