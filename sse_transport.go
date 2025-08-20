@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -84,13 +85,18 @@ func (t *SSETransport) connectAndServe(connected chan<- struct{}) error {
 	}
 
 	// connected
-	select {
-	case connected <- struct{}{}:
-	default:
-	}
+	go func() {
+		time.Sleep(2 * time.Second) // 等连接建立完全
+		select {
+		case connected <- struct{}{}:
+		default:
+		}
+	}()
 
 	reader := bufio.NewReader(resp.Body)
 	var dataLines []string
+
+	var willEndpoint bool = false
 
 	for {
 		select {
@@ -123,7 +129,32 @@ func (t *SSETransport) connectAndServe(connected chan<- struct{}) error {
 		}
 		if strings.HasPrefix(line, "data:") {
 			dataContent := strings.TrimSpace(line[5:])
+			if willEndpoint {
+				fmt.Println(dataContent)
+				willEndpoint = false
+				// 解析原始URL
+				parsedURL, e := url.Parse(t.eventsURL)
+				if e == nil {
+					fmt.Println(parsedURL)
+					// 解析要拼接的路径和查询参数
+					newPart, e := url.Parse(dataContent)
+					if e == nil {
+						// 拼接URL
+						t.postURL = parsedURL.ResolveReference(newPart).String()
+						fmt.Println(t.postURL)
+						continue
+					}
+				}
+			}
 			dataLines = append(dataLines, dataContent)
+		}
+		if strings.HasPrefix(line, "event:") {
+			et := strings.TrimSpace(line[6:])
+			if et == "endpoint" {
+				willEndpoint = true
+			}
+		} else {
+			willEndpoint = false
 		}
 	}
 }
