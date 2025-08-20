@@ -26,7 +26,7 @@ type DialOptions struct {
 	OnDisconnected func(error)
 	OnReconnected  func()
 
-	// New hooks (增加)
+	// New hooks
 	OnMessage          func([]byte)                             // 每条收到的消息（transport 层）
 	OnReconnectAttempt func(attempt int, backoff time.Duration) // 每次尝试重连时触发（用于 metrics / debug）
 
