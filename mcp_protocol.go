@@ -51,3 +51,23 @@ func (c *MCPClient) ToolsCall(ctx context.Context, name string, params any) (jso
 	}
 	return *resp.Result, nil
 }
+
+func (c *MCPClient) Initialize(ctx context.Context, params any) (json.RawMessage, error) {
+	var payload any
+	if raw, ok := params.(json.RawMessage); ok {
+		payload = map[string]any{"params": raw}
+	} else {
+		payload = map[string]any{"params": params}
+	}
+
+	resp, err := c.Call(ctx, "initialize", payload)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Result == nil {
+		return []byte(""), nil
+	}
+
+	return *resp.Result, nil
+}
