@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"github.com/gorilla/websocket"
+	"github.com/llmdo/mcpc/examples/mcpserver_for_test/mcps"
 	"log"
-	"mcpserver_for_test/mcps"
 	"net/http"
 	"time"
 )

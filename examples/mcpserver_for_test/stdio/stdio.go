@@ -4,9 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"github.com/llmdo/mcpc/examples/mcpserver_for_test/mcps"
 	"io"
 	"log"
-	"mcpserver_for_test/mcps"
 	"os"
 	"strings"
 )

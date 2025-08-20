@@ -7,9 +7,10 @@
 package main
 
 import (
+	"github.com/llmdo/mcpc/examples/mcpserver_for_test/ssews"
+	"github.com/llmdo/mcpc/examples/mcpserver_for_test/stdio"
 	"log"
-	"mcpserver_for_test/ssews"
-	"mcpserver_for_test/stdio"
+
 	"net/http"
 	"os"
 	"strings"
@@ -20,8 +21,12 @@ import (
    ========================= */
 
 func main() {
+	mode := ""
 	// 切换mode来测试不同的客户端
-	mode := EnvStr("MCP_MODE", "")
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+
 	// 此处 为演示，应该在客户端中直接调用
 	if strings.ToUpper(mode) == "STDIO" {
 		stdio.StdioLoop()
