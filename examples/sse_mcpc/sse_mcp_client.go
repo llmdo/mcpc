@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -54,13 +53,20 @@ func main() {
 		log.Printf("[notify] method=%s params=%s", method, string(params))
 	})
 
+	rpcResponse, err := client.Call(context.Background(), "initialize", map[string]any{"client": "client 123"})
+	if err != nil {
+		log.Fatalf("call initialize failed: %v", err)
+	} else {
+		log.Printf("initialize result: %s\n", string(*rpcResponse.Result))
+	}
+
 	// 发起 RPC 请求
 	// !!! sse示例的方法在ws都可以使用，Call CallBatch ToolsCall ToolsList 都是可用的方法
 	resp, err := client.ToolsCall(context.Background(), "echo", map[string]any{"message": "Hello from MCP client"})
 	if err != nil {
 		log.Fatalf("call failed: %v", err)
 	}
-	fmt.Println("pong:", string(resp))
+	log.Println("pong:", string(resp))
 
 	// 发送通知
 	_ = client.Notify(context.Background(), "log", map[string]string{"msg": "hello from SSE"})

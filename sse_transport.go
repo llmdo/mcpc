@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -67,6 +68,10 @@ func (t *SSETransport) connectAndServe(connected chan<- struct{}) error {
 
 	req, _ := http.NewRequestWithContext(opt.CancelCtx, http.MethodGet, t.eventsURL, nil)
 	req.Header = opt.Headers.Clone()
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Connection", "keep-alive")
+	log.Println(req.Header)
 
 	resp, err := t.client.Do(req)
 	if err != nil {
