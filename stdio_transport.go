@@ -14,7 +14,11 @@ import (
 )
 
 /* =========================
-   Stdio Transport（与原版一致，增加日志健壮性）
+   Stdio Transport
+   - 与 WS/SSE 风格统一
+   - 支持 CancelCtx 控制 opts中提供上下文
+   - 统一错误模型 (TransportError)
+   - 支持 Hook (OnMessage / OnDisconnect) opt中提供hook函数
    ========================= */
 
 type StdioTransport struct {
@@ -23,16 +27,22 @@ type StdioTransport struct {
 	muW   sync.Mutex
 	recvC chan []byte
 	alive atomic.Bool
-	stop  chan struct{}
 	wg    sync.WaitGroup
+
+	opts *DialOptions
 }
 
-func NewStdioTransport() *StdioTransport {
+func NewStdioTransport(opts *DialOptions) *StdioTransport {
+	if opts == nil {
+		opts = &DialOptions{}
+	}
+	opts = opts.WithDefaults()
+
 	t := &StdioTransport{
 		r:     bufio.NewReader(os.Stdin),
 		w:     bufio.NewWriter(os.Stdout),
 		recvC: make(chan []byte, 128),
-		stop:  make(chan struct{}),
+		opts:  opts,
 	}
 	t.alive.Store(true)
 	t.wg.Add(1)
@@ -43,7 +53,27 @@ func NewStdioTransport() *StdioTransport {
 func (t *StdioTransport) readLoop() {
 	defer close(t.recvC)
 	defer t.wg.Done()
+	defer func() {
+		if h := t.opts.OnDisconnected; h != nil {
+			h(nil)
+		}
+	}()
+
+	ctx := context.Background()
+	if t.opts.CancelCtx != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(t.opts.CancelCtx)
+		defer cancel()
+	}
+
 	for t.alive.Load() {
+		select {
+		case <-ctx.Done():
+			t.alive.Store(false)
+			return
+		default:
+		}
+
 		// 读头部
 		length := -1
 		for {
@@ -54,7 +84,7 @@ func (t *StdioTransport) readLoop() {
 			}
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
-				break // 头结束
+				break // header end
 			}
 			if strings.HasPrefix(strings.ToLower(line), "content-length:") {
 				v := strings.TrimSpace(line[len("content-length:"):])
@@ -66,11 +96,18 @@ func (t *StdioTransport) readLoop() {
 			log.Printf("[stdio] invalid header: missing Content-Length")
 			continue
 		}
+
 		body := make([]byte, length)
 		if _, err := io.ReadFull(t.r, body); err != nil {
 			t.alive.Store(false)
 			return
 		}
+
+		// Hook
+		if h := t.opts.OnMessage; h != nil {
+			h(body)
+		}
+
 		t.recvC <- body
 	}
 }
@@ -81,14 +118,18 @@ func (t *StdioTransport) Send(ctx context.Context, payload []byte) error {
 	}
 	t.muW.Lock()
 	defer t.muW.Unlock()
+
 	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(payload))
 	if _, err := t.w.WriteString(header); err != nil {
-		return err
+		return &TransportError{Op: "write", Err: err, Temporary: false}
 	}
 	if _, err := t.w.Write(payload); err != nil {
-		return err
+		return &TransportError{Op: "write", Err: err, Temporary: false}
 	}
-	return t.w.Flush()
+	if err := t.w.Flush(); err != nil {
+		return &TransportError{Op: "write", Err: err, Temporary: false}
+	}
+	return nil
 }
 
 func (t *StdioTransport) Recv() <-chan []byte { return t.recvC }
@@ -97,9 +138,8 @@ func (t *StdioTransport) Close() error {
 	if !t.alive.Swap(false) {
 		return nil
 	}
-	close(t.stop)
-	_ = t.w.Flush()
 	t.wg.Wait()
+	_ = t.w.Flush()
 	return nil
 }
 

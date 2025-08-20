@@ -20,6 +20,7 @@ func TestMCPClient(t *testing.T) {
 	}{
 		{"SSE", "SSE"},
 		{"WebSocket", "WS"},
+		{"STDIO", "STDIO"},
 	}
 
 	for _, tt := range tests {
@@ -67,7 +68,7 @@ func totest(model string) error {
 			return err
 		}
 	case "STDIO":
-		tr = NewStdioTransport()
+		tr = NewStdioTransport(nil)
 	default:
 		log.Fatalf("unknown MCP_MODE %s", mode)
 	}
