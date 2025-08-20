@@ -38,9 +38,9 @@ func (c *MCPClient) ToolsList(ctx context.Context) (*ToolsListResult, error) {
 func (c *MCPClient) ToolsCall(ctx context.Context, name string, params any) (json.RawMessage, error) {
 	var payload any
 	if raw, ok := params.(json.RawMessage); ok {
-		payload = map[string]any{"name": name, "params": raw}
+		payload = map[string]any{"name": name, "arguments": raw}
 	} else {
-		payload = map[string]any{"name": name, "params": params}
+		payload = map[string]any{"name": name, "arguments": params}
 	}
 	resp, err := c.Call(ctx, "tools/call", payload)
 	if err != nil {
